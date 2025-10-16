@@ -1,92 +1,203 @@
-import re
-try:
-    import hazm
-except ImportError:
-    print("Error: The 'hazm' library is not installed. Please install it using 'pip install hazm'")
-    hazm = None
+"""
+پیش‌پردازش و پاکسازی متن فارسی
+"""
 
-from src.utils.logger import logger
+import re
+import hazm
+from typing import Dict, List
+from pathlib import Path
+
 
 class TextPreprocessor:
     """
-    Handles intelligent preprocessing of Persian text for the RAG pipeline.
+    کلاس پیش‌پردازش متن فارسی
     """
+
     def __init__(self):
-        if hazm:
-            self.normalizer = hazm.Normalizer()
-            logger.info("TextPreprocessor initialized with hazm normalizer.")
-        else:
-            self.normalizer = None
-            logger.warning("TextPreprocessor initialized without hazm normalizer. Normalization will be skipped.")
+        """مقداردهی اولیه"""
+        self.normalizer = hazm.Normalizer()
+        self.word_tokenizer = hazm.WordTokenizer()
+        self.sent_tokenizer = hazm.SentenceTokenizer()
 
-    def clean_text(self, text: str, remove_old_tags: bool = True) -> str:
+    def clean_text(self, text: str, remove_old_tags: bool = True,
+                   remove_metadata: bool = True) -> str:
         """
-        Performs a series of cleaning steps on the input text.
-        1. Normalization (if hazm is available).
-        2. Removal of previous processing tags.
-        3. Whitespace and newline cleanup.
+        نرمالیزه و پاکسازی کامل متن
+
+        Args:
+            text: متن ورودی
+            remove_old_tags: حذف تگ‌های قبلی (@@-0000-@@)
+            remove_metadata: حذف metadata قبلی
+
+        Returns:
+            str: متن پاک شده
         """
-        logger.info(f"Starting text cleaning. Original length: {len(text)} chars.")
+        if not text:
+            return ""
 
-        # 1. Normalize the text using hazm
-        if self.normalizer:
-            text = self.normalizer.normalize(text)
-        else:
-            logger.warning("Skipping text normalization because hazm library is not available.")
+        # مرحله 1: نرمالیزه‌سازی اولیه
+        text = self.normalizer.normalize(text)
 
-        # 2. Remove old tags if requested
+        # مرحله 2: حذف تگ‌های قبلی
         if remove_old_tags:
-            # A generic tag pattern for chunk boundaries, like @@-0001-@@
+            # تگ‌های استاندارد: @@-0000-@@
             text = re.sub(r'@@-\d{4}-@@', '', text)
 
-            # A pattern for visual separators, like a long line of dashes
-            text = re.sub(r'^[─=\-*]{10,}$', '', text, flags=re.MULTILINE)
+            # تگ‌های احتمالی دیگر
+            text = re.sub(r'@@.*?@@', '', text)
 
-            # A pattern for simple metadata tags, like [words: 123]
-            text = re.sub(r'\[\w+:\s*\d+\]', '', text, flags=re.IGNORECASE)
-            logger.debug("Removed old processing tags and separators.")
+            # خطوط جداکننده
+            text = re.sub(r'^[─=\-*_]{20,}$', '', text, flags=re.MULTILINE)
 
-        # 3. Clean up whitespace
-        text = re.sub(r' +', ' ', text)  # Replace multiple spaces with a single space
-        text = re.sub(r'\n{3,}', '\n\n', text)  # Replace 3+ newlines with exactly 2
+        # مرحله 3: حذف metadata قبلی
+        if remove_metadata:
+            # metadata در براکت مربع: [کلمات: 450 | جملات: 12]
+            text = re.sub(r'\[.*?\]', '', text)
 
-        # 4. Trim leading/trailing whitespace from the whole text
+            # metadata با pipe: کلمات: 450 | جملات: 12
+            text = re.sub(r'(کلمات|جملات|Stage|اطمینان|کلیدواژه):.*?\|', '', text)
+
+        # مرحله 4: پاکسازی فضاها
+        # فضاهای متوالی
+        text = re.sub(r' {2,}', ' ', text)
+
+        # تب‌های متوالی
+        text = re.sub(r'\t+', ' ', text)
+
+        # خطوط خالی بیش از 2 خط
+        text = re.sub(r'\n{3,}', '\n\n', text)
+
+        # فضای خالی در ابتدا/انتهای خطوط
+        lines = text.split('\n')
+        lines = [line.strip() for line in lines]
+        text = '\n'.join(lines)
+
+        # مرحله 5: Trim نهایی
         text = text.strip()
 
-        logger.info(f"Finished text cleaning. New length: {len(text)} chars.")
         return text
 
-    def extract_document_info(self, text: str) -> dict:
+    def extract_doc_info(self, text: str) -> Dict:
         """
-        Extracts basic statistics from the document text.
+        استخراج اطلاعات آماری از متن
+
+        Args:
+            text: متن ورودی
+
+        Returns:
+            dict: دیکشنری اطلاعات
         """
         if not text:
             return {
-                'word_count': 0, 'char_count': 0,
-                'sentence_count': 0, 'paragraph_count': 0,
-                'avg_words_per_para': 0
+                'word_count': 0,
+                'char_count': 0,
+                'sentence_count': 0,
+                'paragraph_count': 0,
+                'avg_words_per_sentence': 0.0,
+                'avg_words_per_paragraph': 0.0
             }
 
-        # A simple word split; for more accuracy, a tokenizer could be used.
-        words = text.split()
+        # شمارش کاراکترها
+        char_count = len(text)
+
+        # شمارش کلمات
+        words = self.word_tokenizer.tokenize(text)
         word_count = len(words)
 
-        # Sentences are approximated by counting terminal punctuation.
-        # This is a rough estimate.
-        sentences = text.count('.') + text.count('!') + text.count('؟')
+        # شمارش جملات
+        try:
+            sentences = self.sent_tokenizer.tokenize(text)
+            sentence_count = len(sentences)
+        except:
+            # fallback ساده
+            sentence_count = text.count('.') + text.count('!') + text.count('?')
 
-        # Paragraphs are non-empty lines.
+        # شمارش پاراگراف‌ها
         paragraphs = [p for p in text.split('\n') if p.strip()]
         paragraph_count = len(paragraphs)
 
-        avg_words_per_para = word_count / paragraph_count if paragraph_count > 0 else 0
+        # میانگین‌ها
+        avg_words_per_sentence = word_count / sentence_count if sentence_count > 0 else 0.0
+        avg_words_per_paragraph = word_count / paragraph_count if paragraph_count > 0 else 0.0
 
-        stats = {
+        return {
             'word_count': word_count,
-            'char_count': len(text),
-            'sentence_count': sentences,
+            'char_count': char_count,
+            'sentence_count': sentence_count,
             'paragraph_count': paragraph_count,
-            'avg_words_per_para': round(avg_words_per_para, 2)
+            'avg_words_per_sentence': round(avg_words_per_sentence, 1),
+            'avg_words_per_paragraph': round(avg_words_per_paragraph, 1)
         }
-        logger.info(f"Extracted document info: {stats}")
-        return stats
+
+    def split_into_paragraphs(self, text: str) -> List[str]:
+        """
+        تقسیم متن به پاراگراف‌ها
+
+        Args:
+            text: متن ورودی
+
+        Returns:
+            list: لیست پاراگراف‌ها (بدون خطوط خالی)
+        """
+        paragraphs = text.split('\n')
+        paragraphs = [p.strip() for p in paragraphs if p.strip()]
+        return paragraphs
+
+    def clean_pattern_text(self, text: str) -> str:
+        """
+        پاکسازی متن الگوها (از TextArea)
+
+        Args:
+            text: متن الگوها
+
+        Returns:
+            str: متن پاک شده
+        """
+        # حذف فضاهای اضافی
+        lines = text.split('\n')
+        cleaned_lines = []
+
+        for line in lines:
+            line = line.strip()
+            # حذف خطوط خالی و کامنت‌ها
+            if line and not line.startswith('#'):
+                cleaned_lines.append(line)
+
+        return '\n'.join(cleaned_lines)
+
+
+# تست
+if __name__ == "__main__":
+    print("🧪 تست preprocessor.py\n")
+
+    preprocessor = TextPreprocessor()
+
+    # متن نمونه
+    sample_text = """
+    @@-0001-@@
+
+    این    یک   متن     تست است.
+
+
+    با فضاهای    اضافی و خطوط    خالی.
+
+    [کلمات: 450 | جملات: 12 | Stage: 1]
+
+    ────────────────────────────────
+
+    این پاراگراف دوم است.
+    """
+
+    print("1️⃣ متن اصلی:")
+    print(repr(sample_text)[:100] + "...\n")
+
+    # پاکسازی
+    cleaned = preprocessor.clean_text(sample_text)
+    print("2️⃣ متن پاک شده:")
+    print(repr(cleaned) + "\n")
+
+    # استخراج اطلاعات
+    info = preprocessor.extract_doc_info(cleaned)
+    print("3️⃣ اطلاعات متن:")
+    for key, value in info.items():
+        print(f"   {key}: {value}")

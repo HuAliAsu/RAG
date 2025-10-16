@@ -1,203 +1,229 @@
+"""
+الگوریتم چانکینگ سه مرحله‌ای با سیستم دو لایه
+Parent-Child Chunking Strategy
+"""
+
 import re
-from typing import List, Dict, Any
-
-from src.utils.logger import logger
-from src.core.embedder import ollama_embedder
-# from sklearn.metrics.pairwise import cosine_similarity
-# from sklearn.feature_extraction.text import TfidfVectorizer
-
-# --- Default Persian Patterns ---
-
-STRUCTURAL_PATTERNS_DEFAULT = """
-# عناوین فصل و بخش - اولویت بالا
-5.0,1,chapter_title,^(فصل|بخش|قسمت)\\s+[\\d۰-۹]+
-4.5,1,chapter_named,^(فصل|بخش)\\s+[\\d۰-۹]+\\s*[:-]\\s*.+
-3.5,1,numbered_section,^[\\d۰-۹]+[\\.\\)]\\s+[^\\n]{5,50}$
-# داستان‌ها و حکایت‌ها
-4.0,1,story_title,^(داستان|حکایت|قصه)\\s+[\\d۰-۹]+
-3.5,1,story_named,^(داستان|حکایت)\\s*[:-]\\s*.+
-# شماره‌گذاری‌های ترتیبی
-3.0,1,ordinal_title,^(اول|دوم|سوم|چهارم|پنجم|ششم|هفتم|هشتم|نهم|دهم|یازدهم|دوازدهم)\\s*[-:]\\s*
-# جداکننده‌های بصری
-3.5,1,visual_separator,^[=\\-*]{3,}\\s*$
-# الگوی عنوان کوتاه در خط مجزا (احتمالی)
-2.0,2,short_isolated_title,^.{5,40}$
-"""
-
-SEMANTIC_PATTERNS_DEFAULT = """
-# الگوهای شروع داستان - اولویت متوسط
-2.5,2,story_opening_classic,روزی\\s+روزگاری
-2.5,2,story_opening_folklore,یکی\\s+بود\\s+یکی\\s+نبود
-2.0,2,story_opening_context,در\\s+(زمانی|روزی|شهری|دیاری|سرزمینی)\\s+که
-2.0,2,story_opening_simple,یک\\s+روز
-1.8,2,story_opening_person,(مردی|زنی|پیرمردی|جوانی)\\s+بود\\s+که
-# الگوهای پایان بخش
-2.5,2,lesson_marker,(درس|نکته|آموخته|عبرت)\\s*[:-]\\s*
-2.3,2,lesson_phrase,درس\\s+این\\s+(داستان|حکایت|قصه)
-2.0,2,conclusion_phrase,به\\s+این\\s+ترتیب
-1.8,2,summary_phrase,خلاصه\\s+(اینکه|آنکه)
-# نشانه‌های گفتمان (Discourse Markers)
-2.0,2,discourse_transition,^(حال|اکنون|بگذارید|بیایید)\\s+
-1.8,2,discourse_contrast,^(اما|ولی|با\\s+این\\s+حال|در\\s+مقابل)\\s+
-1.5,2,discourse_addition,^(همچنین|علاوه\\s+بر\\s+این|ضمناً)\\s+
-1.5,2,discourse_example,^(برای\\s+مثال|مثلاً|از\\s+جمله)\\s+
-# نشانه‌های تغییر زمان/مکان
-1.8,2,time_shift,(پس\\s+از|بعد\\s+از)\\s+(مدتی|چندی|سال‌ها|روزها)
-1.8,2,location_shift,در\\s+(شهری|روستایی|مکانی)\\s+دیگر
-"""
-
-SPECIAL_KEYWORDS_DEFAULT = """
-# کلمات کلیدی که نشان‌دهنده مرز قوی هستند
-3.0,1,section_end,پایان\\s+(فصل|بخش|داستان)
-2.5,1,new_topic,موضوع\\s+جدید
-2.5,1,question_marker,پرسش\\s*[:-]\\s*
-2.0,2,reflection,تأمل\\s+در\\s+این\\s+(موضوع|مطلب)
-2.0,2,exercise,تمرین\\s*[:-]\\s*
-# کلمات شخصیت‌ها (برای تشخیص تغییر شخصیت)
-1.5,3,character_intro,(مردی|زنی|پیرمردی|جوانی|کودکی)\\s+به\\s+نام
-1.5,3,character_role,(استاد|معلم|شاگرد|کشاورز|تاجر|پادشاه)\\s+
-"""
+import numpy as np
+from typing import List, Dict, Tuple, Optional
+from datetime import datetime
+import time
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import hazm
 
 
 class OptimizedHybridChunker:
     """
-    Implements a three-stage hybrid chunking strategy for Persian documents.
+    کلاس اصلی چانکینگ سه مرحله‌ای با قابلیت Parent-Child
+
+    Stage 1: Pattern-Based Detection (سریع)
+    Stage 2: Coherence Analysis (متوسط)
+    Stage 3: Semantic Embedding (دقیق)
     """
-    def __init__(self, config: dict):
-        logger.info("Initializing OptimizedHybridChunker...")
+
+    def __init__(self, config: Dict):
+        """
+        مقداردهی اولیه
+
+        Args:
+            config: دیکشنری تنظیمات شامل:
+                - structural_patterns: الگوهای ساختاری
+                - semantic_patterns: الگوهای معنایی
+                - special_keywords: کلمات کلیدی
+                - min_chunk_size: حداقل کلمات
+                - max_chunk_size: حداکثر کلمات
+                - overlap_size: کلمات overlap
+                - coherence_threshold: آستانه coherence
+                - similarity_threshold: آستانه similarity
+                - enable_stage1/2/3: فعال/غیرفعال Stage‌ها
+                - enable_parent_child: فعال‌سازی سیستم دو لایه
+        """
         self.config = config
-        self.min_chunk_size = config.get('min_chunk_size', 200)
+
+        # تنظیمات اندازه
+        self.min_chunk_size = config.get('min_chunk_size', 150)
         self.max_chunk_size = config.get('max_chunk_size', 800)
         self.overlap_size = config.get('overlap_size', 50)
+
+        # تنظیمات Stage‌ها
+        self.enable_stage1 = config.get('enable_stage1', True)
+        self.enable_stage2 = config.get('enable_stage2', True)
+        self.enable_stage3 = config.get('enable_stage3', True)
+
+        # آستانه‌ها
         self.coherence_threshold = config.get('coherence_threshold', 0.15)
         self.similarity_threshold = config.get('similarity_threshold', 0.75)
 
-        # Parse all pattern types from the config
-        self.structural_patterns = self._parse_patterns(config.get('structural_patterns', STRUCTURAL_PATTERNS_DEFAULT))
-        self.semantic_patterns = self._parse_patterns(config.get('semantic_patterns', SEMANTIC_PATTERNS_DEFAULT))
-        self.special_keywords = self._parse_patterns(config.get('special_keywords', SPECIAL_KEYWORDS_DEFAULT))
+        # سیستم دو لایه
+        self.enable_parent_child = config.get('enable_parent_child', True)
+        self.child_chunk_size = config.get('child_chunk_size', 100)
 
-        self.all_patterns = self.structural_patterns + self.semantic_patterns + self.special_keywords
-        logger.info(f"Loaded {len(self.all_patterns)} patterns in total.")
+        # ابزارهای پردازش متن
+        self.normalizer = hazm.Normalizer()
+        self.word_tokenizer = hazm.WordTokenizer()
+        self.sent_tokenizer = hazm.SentenceTokenizer()
 
-        self.embedder = ollama_embedder
-        # self.vectorizer = TfidfVectorizer()
+        # TF-IDF vectorizer برای Stage 2
+        self.vectorizer = TfidfVectorizer(max_features=100)
 
-    def _parse_patterns(self, pattern_string: str) -> List[Dict[str, Any]]:
-        """Parses the multiline pattern string into a list of structured dicts."""
-        parsed = []
-        for line in pattern_string.strip().split('\n'):
-            line = line.strip()
-            if not line or line.startswith('#'):
+        # Embedder (از فاز 1)
+        from src.core.embedder import OllamaEmbedder
+        self.embedder = OllamaEmbedder(
+            model=config.get('embedding_model', 'embeddinggemma:latest')
+        )
+
+        # الگوها
+        self.patterns = self._parse_patterns(config)
+
+        # آمار
+        self.stats = {
+            'stage1_boundaries': 0,
+            'stage2_boundaries': 0,
+            'stage3_boundaries': 0,
+            'embedding_calls': 0,
+            'start_time': 0,
+            'end_time': 0
+        }
+
+    def _parse_patterns(self, config: Dict) -> Dict[str, List[Dict]]:
+        """پارس الگوها از config"""
+        from src.utils.validators import validate_pattern_line
+        from src.utils.logger import debug, warning
+
+        patterns = {
+            'structural': [],
+            'semantic': [],
+            'special': []
+        }
+
+        # پارس هر نوع الگو
+        for pattern_type, config_key in [
+            ('structural', 'structural_patterns'),
+            ('semantic', 'semantic_patterns'),
+            ('special', 'special_keywords')
+        ]:
+            pattern_text = config.get(config_key, '')
+
+            if isinstance(pattern_text, str):
+                lines = pattern_text.strip().split('\n')
+            elif isinstance(pattern_text, list):
+                lines = pattern_text
+            else:
                 continue
 
-            parts = line.split(',', 3)
-            if len(parts) != 4:
-                logger.warning(f"Skipping malformed pattern line: {line}")
-                continue
+            for line in lines:
+                is_valid, error, parsed = validate_pattern_line(line)
 
-            try:
-                weight = float(parts[0])
-                priority = int(parts[1])
-                name = parts[2].strip()
-                regex_pattern = parts[3].strip()
+                if is_valid and parsed:
+                    # کامپایل regex
+                    try:
+                        parsed['regex_compiled'] = re.compile(parsed['regex'])
+                        patterns[pattern_type].append(parsed)
+                        debug(f"   الگوی {pattern_type}: {parsed['name']}")
+                    except re.error as e:
+                        warning(f"   خطا در کامپایل regex '{parsed['name']}': {e}")
 
-                parsed.append({
-                    'weight': weight,
-                    'priority': priority,
-                    'name': name,
-                    'regex': re.compile(regex_pattern, re.MULTILINE)
+        return patterns
+
+    def chunk_text(self, text: str, headings: Optional[List[Dict]] = None,
+                   source_metadata: Optional[Dict] = None) -> Tuple[List[Dict], Dict]:
+        """
+        متد اصلی چانکینگ
+
+        Args:
+            text: متن ورودی
+            headings: لیست عناوین (از Word)
+            source_metadata: metadata فایل اصلی
+
+        Returns:
+            tuple: (chunks, processing_stats)
+        """
+        from src.utils.logger import info, debug
+        from src.core.preprocessor import TextPreprocessor
+
+        self.stats['start_time'] = time.time()
+
+        info("\n" + "="*70)
+        info("🔄 شروع Chunking سه مرحله‌ای")
+        info("="*70)
+
+        # پیش‌پردازش
+        preprocessor = TextPreprocessor()
+        text = preprocessor.clean_text(text, remove_old_tags=True)
+
+        paragraphs = text.split('\n')
+        paragraphs = [p.strip() for p in paragraphs if p.strip()]
+
+        info(f"📝 تعداد پاراگراف‌ها: {len(paragraphs)}")
+
+        # مرحله 1: تجمیع مرزها
+        all_boundaries = []
+
+        # افزودن Heading‌ها
+        if headings:
+            info(f"\n📑 {len(headings)} عنوان Heading شناسایی شد")
+            for heading in headings:
+                all_boundaries.append({
+                    'index': heading['para_index'],
+                    'score': 5.0,
+                    'confidence': 1.0,
+                    'text': heading['text'],
+                    'signals': ['heading'],
+                    'stage': 0,
+                    'stage_name': 'Heading',
+                    'heading_level': heading['level'],
+                    'priority': 1
                 })
-            except (ValueError, re.error) as e:
-                logger.error(f"Failed to parse pattern line '{line}': {e}")
 
-        return parsed
+        # Stage 1: Pattern Detection
+        if self.enable_stage1:
+            stage1_boundaries = self._stage1_pattern_detection(paragraphs)
+            all_boundaries.extend(stage1_boundaries['confirmed'])
+            uncertain_boundaries = stage1_boundaries['uncertain']
+        else:
+            info("\n⏭️ Stage 1 غیرفعال است")
+            uncertain_boundaries = []
 
-    def chunk_text(self, text: str) -> List[Dict[str, Any]]:
-        """
-        Orchestrates the 3-stage chunking process.
-        This is a placeholder for the full, complex logic.
-        """
-        logger.info("Starting 3-stage chunking process...")
+        # Stage 2: Coherence Analysis
+        if self.enable_stage2 and uncertain_boundaries:
+            stage2_boundaries = self._stage2_coherence_analysis(paragraphs, uncertain_boundaries)
+            all_boundaries.extend(stage2_boundaries['confirmed'])
+            uncertain_boundaries = stage2_boundaries['uncertain']
+        elif not self.enable_stage2:
+            info("\n⏭️ Stage 2 غیرفعال است")
 
-        # Stage 1: Find all potential boundaries using regex patterns
-        boundaries = self._find_pattern_based_boundaries(text)
-        logger.info(f"Stage 1 found {len(boundaries)} potential boundaries.")
+        # Stage 3: Semantic Embedding
+        if self.enable_stage3 and uncertain_boundaries and self.embedder.available:
+            stage3_boundaries = self._stage3_semantic_verification(paragraphs, uncertain_boundaries)
+            all_boundaries.extend(stage3_boundaries)
+        elif not self.enable_stage3:
+            info("\n⏭️ Stage 3 غیرفعال است")
+        elif not self.embedder.available:
+            info("\n⚠️ Stage 3: Ollama در دسترس نیست")
 
-        # Stages 2 & 3 will be developed here to refine boundaries
-        # For now, we will use a simplified logic
+        # مرتب‌سازی
+        all_boundaries.sort(key=lambda x: x['index'])
 
-        # Create initial chunks based on definitive boundaries (Priority 1)
-        definitive_boundaries = [b['pos'] for b in boundaries if b['pattern']['priority'] == 1]
-        split_points = sorted(list(set([0] + definitive_boundaries + [len(text)])))
+        # ساخت chunk‌ها
+        info("\n✂️ ساخت chunk‌ها...")
+        chunks = self._create_chunks_from_boundaries(
+            paragraphs, all_boundaries, source_metadata
+        )
 
-        raw_chunks = []
-        for i in range(len(split_points) - 1):
-            start, end = split_points[i], split_points[i+1]
-            chunk_text = text[start:end].strip()
-            if chunk_text:
-                raw_chunks.append({'text': chunk_text, 'start_char': start})
+        # سیستم Parent-Child
+        if self.enable_parent_child:
+            info("\n👨‍👦 ساخت ساختار Parent-Child...")
+            chunks = self._create_parent_child_structure(chunks)
 
-        # Post-processing: Merge, Split, and Overlap
-        final_chunks = self._post_process_chunks(raw_chunks)
+        # آمار نهایی
+        self.stats['end_time'] = time.time()
+        self.stats['total_time'] = self.stats['end_time'] - self.stats['start_time']
+        self.stats['total_chunks'] = len(chunks)
 
-        logger.info(f"Chunking complete. Produced {len(final_chunks)} final chunks.")
-        return final_chunks
+        self._print_stats()
 
-    def _find_pattern_based_boundaries(self, text: str) -> List[Dict[str, Any]]:
-        """Stage 1: Find boundaries based on all regex patterns."""
-        boundaries = []
-        for pattern in self.all_patterns:
-            for match in pattern['regex'].finditer(text):
-                boundaries.append({
-                    'pos': match.start(),
-                    'pattern': pattern,
-                    'match_text': match.group(0)
-                })
-        return sorted(boundaries, key=lambda x: x['pos'])
+        processing_stats = self.stats.copy()
 
-    def _post_process_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Handles merging small chunks, splitting large ones, and adding overlap.
-        This is a simplified implementation.
-        """
-        # 1. Merge small chunks
-        processed_chunks = []
-        buffer = ""
-        for chunk in chunks:
-            text = chunk['text']
-            if len(text.split()) < self.min_chunk_size and buffer:
-                buffer += "\n\n" + text
-            elif len(text.split()) < self.min_chunk_size:
-                 buffer = text
-            else:
-                if buffer:
-                    processed_chunks.append({'text': buffer})
-                    buffer = ""
-                processed_chunks.append({'text': text})
-        if buffer:
-            processed_chunks.append({'text': buffer})
+        return chunks, processing_stats
 
-        # 2. Split large chunks (simple split for now)
-        final_chunks = []
-        for chunk in processed_chunks:
-            words = chunk['text'].split()
-            if len(words) > self.max_chunk_size:
-                # Simple split by word count
-                for i in range(0, len(words), self.max_chunk_size):
-                     final_chunks.append({'text': ' '.join(words[i:i+self.max_chunk_size])})
-            else:
-                final_chunks.append(chunk)
-
-        # 3. Add overlap
-        for i in range(len(final_chunks) - 1):
-            current_chunk_words = final_chunks[i]['text'].split()
-            next_chunk_words = final_chunks[i+1]['text'].split()
-
-            if len(current_chunk_words) > self.overlap_size:
-                overlap_text = ' '.join(current_chunk_words[-self.overlap_size:])
-                final_chunks[i+1]['text'] = overlap_text + "\n\n" + final_chunks[i+1]['text']
-                final_chunks[i+1]['has_overlap_prev'] = True
-                final_chunks[i]['has_overlap_next'] = True
-
-        return final_chunks

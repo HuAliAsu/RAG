@@ -1,116 +1,323 @@
-import requests
-import json
-from typing import List, Optional
+"""
+سرویس ارتباط با Ollama برای Embedding
+"""
 
-from src.utils.logger import logger
-from src.core.config_manager import config_manager
+import requests
+import numpy as np
+from typing import Optional, List
+import time
+from pathlib import Path
+
 
 class OllamaEmbedder:
     """
-    A service to connect to an Ollama instance and generate embeddings.
+    کلاس مدیریت ارتباط با Ollama
     """
-    def __init__(self):
-        self.base_url = config_manager.get("Ollama", "base_url", fallback="http://localhost:11434")
-        self.model = config_manager.get("Ollama", "embedding_model", fallback="embeddinggemma")
-        self.timeout = config_manager.get_int("Ollama", "timeout", fallback=30)
-        self.max_retries = config_manager.get_int("Ollama", "max_retries", fallback=3)
-        self.api_url = f"{self.base_url}/api/embeddings"
-        self.available = self.check_connection()
 
-    def check_connection(self) -> bool:
+    def __init__(self, model: str = "embeddinggemma",
+                 base_url: str = "http://localhost:11434",
+                 timeout: int = 30,
+                 max_retries: int = 3):
         """
-        Checks if the Ollama service is available and the specified model exists.
+        مقداردهی اولیه
+
+        Args:
+            model: نام مدل embedding
+            base_url: آدرس سرور Ollama
+            timeout: زمان انتظار (ثانیه)
+            max_retries: تعداد تلاش مجدد
         """
-        logger.info(f"Checking connection to Ollama at {self.base_url}...")
+        self.model = model
+        self.base_url = base_url.rstrip('/')
+        self.timeout = timeout
+        self.max_retries = max_retries
+
+        # URLهای API
+        self.embed_url = f"{self.base_url}/api/embeddings"
+        self.tags_url = f"{self.base_url}/api/tags"
+
+        # وضعیت اتصال
+        self.available = False
+        self.last_check_time = 0
+        self.check_interval = 60  # بررسی هر 60 ثانیه
+
+        # آمار
+        self.stats = {
+            'total_calls': 0,
+            'successful_calls': 0,
+            'failed_calls': 0,
+            'total_time': 0.0
+        }
+
+        # بررسی اولیه اتصال
+        self.check_connection()
+
+    def check_connection(self, force: bool = False) -> bool:
+        """
+        بررسی اتصال به Ollama
+
+        Args:
+            force: بررسی اجباری (بدون توجه به زمان)
+
+        Returns:
+            bool: وضعیت اتصال
+        """
+        current_time = time.time()
+
+        # اگر اخیراً چک شده و force نیست، از cache استفاده کن
+        if not force and (current_time - self.last_check_time) < self.check_interval:
+            return self.available
+
         try:
-            # Check if the service is running
-            response = requests.get(self.base_url, timeout=5)
-            response.raise_for_status()
-            logger.info("Ollama service is running.")
+            response = requests.get(self.tags_url, timeout=5)
 
-            # Check if the embedding model is available
-            models_response = requests.get(f"{self.base_url}/api/tags")
-            models_response.raise_for_status()
-            models = models_response.json().get('models', [])
+            if response.status_code == 200:
+                # بررسی وجود مدل
+                data = response.json()
+                models = [m['name'] for m in data.get('models', [])]
 
-            if any(self.model in m['name'] for m in models):
-                logger.info(f"Embedding model '{self.model}' is available on Ollama.")
-                return True
+                if self.model in models:
+                    self.available = True
+                    from src.utils.logger import info
+                    info(f"✅ اتصال به Ollama برقرار - مدل {self.model} موجود است")
+                else:
+                    self.available = False
+                    from src.utils.logger import warning
+                    warning(f"⚠️ مدل {self.model} در Ollama یافت نشد. مدل‌های موجود: {', '.join(models)}")
             else:
-                logger.error(f"Embedding model '{self.model}' not found on Ollama instance.")
-                logger.error(f"Available models: {[m['name'] for m in models]}")
-                logger.error(f"Please pull the model using: 'ollama pull {self.model}'")
-                return False
+                self.available = False
+                from src.utils.logger import warning
+                warning(f"⚠️ Ollama پاسخ نامعتبر داد: {response.status_code}")
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to connect to Ollama at {self.base_url}. Error: {e}")
-            logger.error("Please ensure Ollama is running and accessible.")
-            return False
+        except requests.exceptions.ConnectionError:
+            self.available = False
+            from src.utils.logger import warning
+            warning("⚠️ Ollama در دسترس نیست - آیا سرویس در حال اجرا است؟")
 
-    def get_embedding(self, text: str) -> Optional[List[float]]:
+        except requests.exceptions.Timeout:
+            self.available = False
+            from src.utils.logger import warning
+            warning("⚠️ Timeout در اتصال به Ollama")
+
+        except Exception as e:
+            self.available = False
+            from src.utils.logger import error
+            error(f"❌ خطا در بررسی اتصال Ollama: {str(e)}")
+
+        self.last_check_time = current_time
+        return self.available
+
+    def get_embedding(self, text: str, retry_count: int = 0) -> Optional[np.ndarray]:
         """
-        Generates an embedding for a single piece of text.
+        دریافت embedding برای یک متن
+
+        Args:
+            text: متن ورودی
+            retry_count: تعداد دفعات تلاش شده
+
+        Returns:
+            np.ndarray یا None: بردار embedding
         """
-        if not self.available:
-            logger.warning("Ollama not available. Cannot generate embedding.")
+        if not text or not text.strip():
+            from src.utils.logger import warning
+            warning("⚠️ متن خالی برای embedding")
             return None
 
-        return self.get_embeddings([text])[0] if self.get_embeddings([text]) else None
-
-    def get_embeddings(self, texts: List[str]) -> Optional[List[List[float]]]:
-        """
-        Generates embeddings for a list of texts with retry logic.
-        """
+        # بررسی اتصال
         if not self.available:
-            logger.warning("Ollama not available. Cannot generate embeddings.")
+            self.check_connection(force=True)
+            if not self.available:
+                return None
+
+        start_time = time.time()
+        self.stats['total_calls'] += 1
+
+        try:
+            # ارسال درخواست
+            response = requests.post(
+                self.embed_url,
+                json={
+                    "model": self.model,
+                    "prompt": text
+                },
+                timeout=self.timeout
+            )
+
+            elapsed_time = time.time() - start_time
+
+            if response.status_code == 200:
+                result = response.json()
+                embedding = np.array(result['embedding'], dtype=np.float32)
+
+                # بروزرسانی آمار
+                self.stats['successful_calls'] += 1
+                self.stats['total_time'] += elapsed_time
+
+                from src.utils.logger import debug
+                debug(f"✅ Embedding دریافت شد - dimension: {len(embedding)}, time: {elapsed_time:.2f}s")
+
+                return embedding
+
+            else:
+                from src.utils.logger import error
+                error(f"❌ خطا در دریافت embedding: HTTP {response.status_code}")
+
+                # تلاش مجدد
+                if retry_count < self.max_retries:
+                    from src.utils.logger import info
+                    info(f"🔄 تلاش مجدد {retry_count + 1}/{self.max_retries}...")
+                    time.sleep(1 * (retry_count + 1))  # exponential backoff
+                    return self.get_embedding(text, retry_count + 1)
+
+                self.stats['failed_calls'] += 1
+                return None
+
+        except requests.exceptions.Timeout:
+            from src.utils.logger import error
+            error(f"❌ Timeout در دریافت embedding (>{self.timeout}s)")
+
+            if retry_count < self.max_retries:
+                return self.get_embedding(text, retry_count + 1)
+
+            self.stats['failed_calls'] += 1
             return None
 
-        if not texts:
-            return []
+        except Exception as e:
+            from src.utils.logger import error
+            error(f"❌ خطا در دریافت embedding: {str(e)}")
 
-        logger.info(f"Requesting embeddings for {len(texts)} text(s) using model '{self.model}'.")
+            if retry_count < self.max_retries:
+                return self.get_embedding(text, retry_count + 1)
 
+            self.stats['failed_calls'] += 1
+            return None
+
+    def get_embeddings_batch(self, texts: List[str],
+                             show_progress: bool = False) -> List[Optional[np.ndarray]]:
+        """
+        دریافت embedding برای لیستی از متن‌ها
+
+        Args:
+            texts: لیست متن‌ها
+            show_progress: نمایش پیشرفت
+
+        Returns:
+            list: لیست embedding‌ها (ممکن است برخی None باشند)
+        """
         embeddings = []
-        for text in texts:
-            attempt = 0
-            while attempt < self.max_retries:
-                try:
-                    payload = {
-                        "model": self.model,
-                        "prompt": text
-                    }
-                    response = requests.post(
-                        self.api_url,
-                        data=json.dumps(payload),
-                        timeout=self.timeout
-                    )
-                    response.raise_for_status()
+        total = len(texts)
 
-                    # Ollama returns one embedding per request
-                    result = response.json()
-                    if "embedding" in result:
-                        embeddings.append(result["embedding"])
-                        break  # Success, move to next text
-                    else:
-                        logger.error(f"Unexpected response from Ollama: {result}")
-                        attempt += 1
+        from src.utils.logger import info
+        if show_progress:
+            info(f"📊 شروع دریافت {total} embedding...")
 
-                except requests.exceptions.RequestException as e:
-                    logger.warning(f"Failed to get embedding (attempt {attempt + 1}/{self.max_retries}): {e}")
-                    attempt += 1
+        for idx, text in enumerate(texts, 1):
+            if show_progress and idx % 10 == 0:
+                info(f"   پیشرفت: {idx}/{total} ({idx * 100 // total}%)")
 
-            if attempt == self.max_retries:
-                logger.error(f"Failed to get embedding for a text after {self.max_retries} retries.")
-                # We append None to maintain the list size, or we could skip.
-                # Skipping seems better to avoid downstream errors.
-                continue
+            emb = self.get_embedding(text)
+            embeddings.append(emb)
 
-        if len(embeddings) != len(texts):
-            logger.error("Could not generate embeddings for all provided texts.")
-            return None
+        if show_progress:
+            successful = sum(1 for e in embeddings if e is not None)
+            info(f"✅ {successful}/{total} embedding با موفقیت دریافت شد")
 
-        logger.info(f"Successfully generated {len(embeddings)} embeddings.")
         return embeddings
 
-# Singleton instance for the application
-ollama_embedder = OllamaEmbedder()
+    def calculate_similarity(self, emb1: np.ndarray, emb2: np.ndarray) -> float:
+        """
+        محاسبه شباهت کسینوسی بین دو embedding
+
+        Args:
+            emb1: embedding اول
+            emb2: embedding دوم
+
+        Returns:
+            float: شباهت (0 تا 1)
+        """
+        if emb1 is None or emb2 is None:
+            return 0.0
+
+        # نرمالیزه کردن
+        norm1 = np.linalg.norm(emb1)
+        norm2 = np.linalg.norm(emb2)
+
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+
+        # cosine similarity
+        similarity = np.dot(emb1, emb2) / (norm1 * norm2)
+
+        # تبدیل به بازه [0, 1]
+        similarity = (similarity + 1) / 2
+
+        return float(similarity)
+
+    def get_stats(self) -> dict:
+        """
+        دریافت آمار استفاده
+
+        Returns:
+            dict: دیکشنری آمار
+        """
+        stats = self.stats.copy()
+
+        if stats['successful_calls'] > 0:
+            stats['avg_time'] = stats['total_time'] / stats['successful_calls']
+        else:
+            stats['avg_time'] = 0.0
+
+        if stats['total_calls'] > 0:
+            stats['success_rate'] = stats['successful_calls'] / stats['total_calls']
+        else:
+            stats['success_rate'] = 0.0
+
+        return stats
+
+    def reset_stats(self):
+        """صفر کردن آمار"""
+        self.stats = {
+            'total_calls': 0,
+            'successful_calls': 0,
+            'failed_calls': 0,
+            'total_time': 0.0
+        }
+
+
+# تست
+if __name__ == "__main__":
+    print("🧪 تست embedder.py\n")
+
+    # ایجاد نمونه
+    embedder = OllamaEmbedder()
+
+    # بررسی اتصال
+    print(f"1️⃣ وضعیت اتصال: {'✅ متصل' if embedder.available else '❌ قطع'}\n")
+
+    if embedder.available:
+        # تست embedding تکی
+        print("2️⃣ تست embedding تکی:")
+        emb1 = embedder.get_embedding("این یک متن تست است")
+        if emb1 is not None:
+            print(f"   ✅ Embedding دریافت شد - dimension: {len(emb1)}\n")
+
+        # تست شباهت
+        print("3️⃣ تست شباهت:")
+        emb2 = embedder.get_embedding("این متن مشابه است")
+        emb3 = embedder.get_embedding("موضوع کاملاً متفاوت")
+
+        if emb1 is not None and emb2 is not None and emb3 is not None:
+            sim_12 = embedder.calculate_similarity(emb1, emb2)
+            sim_13 = embedder.calculate_similarity(emb1, emb3)
+            print(f"   شباهت متن 1 و 2: {sim_12:.3f}")
+            print(f"   شباهت متن 1 و 3: {sim_13:.3f}\n")
+
+        # آمار
+        print("4️⃣ آمار:")
+        stats = embedder.get_stats()
+        for key, value in stats.items():
+            print(f"   {key}: {value}")
+    else:
+        print("⚠️ لطفاً Ollama را راه‌اندازی کنید:")
+        print("   $ ollama serve")
+        print(f"   $ ollama pull {embedder.model}")
